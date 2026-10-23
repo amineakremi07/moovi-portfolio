@@ -1,0 +1,143 @@
+'use server'
+
+import { randomBytes } from 'node:crypto'
+
+import { revalidatePath } from 'next/cache'
+import { z } from 'zod'
+
+import { invalidateBooking } from '@/lib/cache'
+import { requireOrgAction } from '@/lib/org-access'
+import { hashShareToken, resolveViewer } from '@/lib/pass'
+import { onlinePaymentMode, onlineProvider, shareInvitePath, SHARE_TOKEN_PATTERN } from '@/lib/payments'
+import { GUEST_TOKEN_PATTERN } from '@/lib/guest-cancel'
+import { getSupabaseAdmin } from '@/lib/supabase/optimized-client'
+import { actionRateLimit } from '@/lib/rate-limit'
+import { captureAudit, timed } from '@/lib/telemetry'
+import { stripHtml } from '@/lib/sanitize-text'
+
+export type PaymentActionResult<T = object> = ({ ok: true } & T) | { ok: false; message: string }
+
+function mapPaymentError(message: string | undefined): string {
+  const m = message ?? ''
+  if (m.includes('invalid_invite')) return 'Ce lien de paiement n\'est pas valide.'
+  if (m.includes('already_paid')) return 'Cette part a déjà été payée.'
+  if (m.includes('booking_not_payable')) return 'Cette réservation n\'est plus ouverte au paiement (elle a peut-être été annulée).'
+  if (m.includes('nothing_to_pay')) return 'Il ne reste rien à encaisser sur cette réservation.'
+  console.error('payment action failed', m)
+  return 'Une erreur est survenue. Veuillez réessayer.'
+}
+
+/* ---------------------------------------------------------------------------
+   A friend pays their share through the invite link. The token is the only proof
+   (like a guest cancel link); the sandbox provider is refused in production.
+   ------------------------------------------------------------------------ */
+
+const payShareSchema = z.object({
+  token: z.string().regex(SHARE_TOKEN_PATTERN),
+  payerName: z.string().trim().max(100).transform(stripHtml).optional(),
+})
+
+export async function payShareAction(...args: Parameters<typeof payShareActionImpl>): ReturnType<typeof payShareActionImpl> {
+  return timed('action.payment.share', () => payShareActionImpl(...args))
+}
+
+async function payShareActionImpl(
+  input: z.input<typeof payShareSchema>
+): Promise<PaymentActionResult<{ amount: number; confirmed: boolean }>> {
+  const limited = await actionRateLimit('booking')
+  if (limited) return { ok: false, message: limited }
+
+  const parsed = payShareSchema.safeParse(input)
+  if (!parsed.success) return { ok: false, message: 'Ce lien de paiement n\'est pas valide.' }
+
+  const provider = onlineProvider(onlinePaymentMode())
+  if (!provider) return { ok: false, message: 'Le paiement en ligne n\'est pas encore disponible. Veuillez payer l\'organisateur ou le club.' }
+
+  const { data, error } = await getSupabaseAdmin().rpc('pay_booking_share', {
+    p_token_hash: hashShareToken(parsed.data.token),
+    p_provider: provider,
+    p_payer_name: parsed.data.payerName,
+  })
+  if (error) return { ok: false, message: mapPaymentError(error.message) }
+
+  const row = data as { amount: number; confirmed: boolean }
+  // The share's booking (its club's schedule, analytics and, once fully paid, its status change).
+  const { data: share } = await getSupabaseAdmin()
+    .from('booking_shares')
+    .select('bookings(id, org_id, booker_profile_id)')
+    .eq('invite_token_hash', hashShareToken(parsed.data.token))
+    .maybeSingle()
+  if (share?.bookings) {
+    await invalidateBooking({ orgId: share.bookings.org_id, bookerId: share.bookings.booker_profile_id })
+  }
+  revalidatePath('/reservations')
+  revalidatePath('/dashboard/org/bookings')
+  return { ok: true, amount: Number(row.amount), confirmed: row.confirmed }
+}
+
+/* ---------------------------------------------------------------------------
+   Staff collect the cash at the venue: payment -> paid, booking -> confirmed.
+   ------------------------------------------------------------------------ */
+
+export async function markCashPaidAction(...args: Parameters<typeof markCashPaidActionImpl>): ReturnType<typeof markCashPaidActionImpl> {
+  return timed('action.payment.cash', () => markCashPaidActionImpl(...args))
+}
+
+async function markCashPaidActionImpl(bookingId: string): Promise<PaymentActionResult> {
+  if (!z.string().uuid().safeParse(bookingId).success) return { ok: false, message: 'Réservation invalide.' }
+
+  const auth = await requireOrgAction(['org_admin', 'staff'])
+  if (!auth.ok) return { ok: false, message: auth.message }
+
+  // The RPC also filters on the caller's org, so another club's booking id finds nothing.
+  const { error } = await getSupabaseAdmin().rpc('mark_cash_paid', {
+    p_booking_id: bookingId,
+    p_org_id: auth.ctx.orgId,
+  })
+  if (error) return { ok: false, message: mapPaymentError(error.message) }
+
+  captureAudit({ action: 'payment.mark_cash_paid', status: 'paid', booking_id: bookingId, org_id: auth.ctx.orgId, actor: auth.ctx.role })
+  await invalidateBooking({ orgId: auth.ctx.orgId, bookingId })
+  revalidatePath('/dashboard/org/bookings')
+  revalidatePath('/dashboard/org/analytics')
+  revalidatePath('/reservations')
+  return { ok: true }
+}
+
+/* ---------------------------------------------------------------------------
+   The organizer lost an invite link (only its hash is stored, so it cannot be
+   shown again): mint a new one for a still-pending share. The old link stops working.
+   ------------------------------------------------------------------------ */
+
+const regenerateSchema = z.object({
+  bookingId: z.string().uuid(),
+  shareNo: z.number().int().min(2).max(4),
+  guestToken: z.string().regex(GUEST_TOKEN_PATTERN).optional(),
+})
+
+export async function regenerateShareInviteAction(
+  input: z.input<typeof regenerateSchema>
+): Promise<PaymentActionResult<{ path: string }>> {
+  const parsed = regenerateSchema.safeParse(input)
+  if (!parsed.success) return { ok: false, message: 'Requête invalide.' }
+  const { bookingId, shareNo, guestToken } = parsed.data
+
+  const access = await resolveViewer(bookingId, guestToken)
+  // Only the person who booked (or holds the guest link) manages invites; club staff do not.
+  // A read-only pass link (`pass`) can look at the booking but never change it.
+  if (!access || access.viewer === 'staff' || access.viewer === 'pass') return { ok: false, message: 'Vous ne pouvez pas modifier cette réservation.' }
+
+  const token = randomBytes(24).toString('hex')
+  const { data, error } = await getSupabaseAdmin()
+    .from('booking_shares')
+    .update({ invite_token_hash: hashShareToken(token) })
+    .eq('booking_id', bookingId)
+    .eq('share_no', shareNo)
+    .eq('status', 'pending')
+    .eq('is_organizer', false)
+    .select('id')
+  if (error || !data?.length) return { ok: false, message: 'Cette part est déjà payée ou n\'existe pas.' }
+
+  revalidatePath(`/reservations/${bookingId}`)
+  return { ok: true, path: shareInvitePath(token) }
+}

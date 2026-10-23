@@ -1,0 +1,49 @@
+import { randomBytes } from 'node:crypto'
+
+import type { User } from '@supabase/supabase-js'
+
+import { consentMetadata } from '@/lib/legal'
+import { getSupabaseAdmin } from '@/lib/supabase/optimized-client'
+
+export { assessGoogleSignIn, isGoogleUser } from '@/lib/google-identity'
+
+/** Replace the password with an unguessable one, so whoever set the old (unconfirmed) one can no longer sign in. */
+export async function neutraliseUnprovenPassword(userId: string): Promise<boolean> {
+  const { error } = await getSupabaseAdmin().auth.admin.updateUserById(userId, { password: randomBytes(32).toString('hex') })
+  if (error) console.error('google sign-in: could not reset the unproven password', error.message)
+  return !error
+}
+
+/**
+ * First Google sign-in: create the player profile (no database trigger makes profiles). Players are
+ * not tied to a club; when the button was used on a club page, that club becomes the player's last
+ * visited one (only if it is approved and not archived). Terms acceptance is recorded in the account
+ * metadata, like every other sign-up path (the Google button says that continuing means accepting the
+ * Terms and Privacy Policy). Returns false when no profile was made.
+ */
+export async function createGooglePlayerProfile(user: User, orgId: string | null): Promise<boolean> {
+  const admin = getSupabaseAdmin()
+  const { data: org } = orgId
+    ? await admin.from('organizations').select('id').eq('id', orgId).eq('status', 'approved').is('deleted_at', null).maybeSingle()
+    : { data: null }
+
+  const meta = user.user_metadata ?? {}
+  const name = String(meta.full_name ?? meta.name ?? user.email?.split('@')[0] ?? 'Joueur')
+    .replace(/[<>]/g, '')
+    .trim()
+    .slice(0, 100)
+
+  const { error } = await admin.from('profiles').insert({
+    id: user.id,
+    org_id: null,
+    last_visited_club_id: org?.id ?? null,
+    role: 'player',
+    display_name: name.length >= 2 ? name : 'Joueur',
+  })
+  if (error) {
+    console.error('google sign-up: profile insert failed', { code: error.code, message: error.message })
+    return false
+  }
+  await admin.auth.admin.updateUserById(user.id, { user_metadata: { ...meta, ...consentMetadata() } })
+  return true
+}

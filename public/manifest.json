@@ -1,0 +1,23 @@
+{
+  "name": "Moovi - Réservez vos terrains de Padel, Tennis & Foot en Tunisie",
+  "short_name": "Moovi",
+  "description": "Réservez des terrains de padel, de tennis et de football partout en Tunisie. Disponibilités en direct, prix en TND.",
+  "id": "/",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#1d3023",
+  "theme_color": "#1d3023",
+  "lang": "fr",
+  "categories": ["sports", "lifestyle"],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Trouver un terrain", "url": "/explore", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Mes réservations", "url": "/reservations", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}
